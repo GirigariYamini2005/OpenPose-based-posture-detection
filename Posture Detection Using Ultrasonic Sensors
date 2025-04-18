@@ -1,0 +1,120 @@
+import os
+import cv2
+import csv
+import time
+import math
+import serial
+import threading
+import numpy as np
+from config_reader import config_reader
+from model import get_testing_model
+import util
+from scipy.ndimage.filters import gaussian_filter
+from posture_classifier import get_posture_label  # Optional, if needed
+
+# Global variable for Arduino data
+arduino_posture = "UNKNOWN"
+back_distance = 0
+side_distance = 0
+
+# Start Arduino thread
+def read_arduino():
+    global arduino_posture, back_distance, side_distance
+    try:
+        ser = serial.Serial('COM7', 9600, timeout=1)  # Replace COM7 if needed                                                     tttt
+        time.sleep(2)
+        ser.flushInput()
+        while True:
+            if ser.in_waiting:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if line.startswith("Back:"):
+                    try:
+                        parts = line.replace("Back:", "").replace("Side:", "").replace("cm", "").split(",")
+                        back_distance = float(parts[0].strip())
+                        side_distance = float(parts[1].strip())
+                        if back_distance > 0 or side_distance > 0:
+                            arduino_posture = "BAD" if (back_distance > 35 or side_distance > 35) else "GOOD"
+                    except:
+                        continue
+    except Exception as e:
+        print(f"⚠ Arduino Error: {e}")
+        arduino_posture = "DISCONNECTED"
+
+# OpenPose frame processing
+def process(frame, params, model_params, model):
+    temp_path = 'temp_frame.jpg'
+    cv2.imwrite(temp_path, frame)
+
+    oriImg = cv2.imread(temp_path)
+    multiplier = [x * model_params['boxsize'] / oriImg.shape[0] for x in params['scale_search']]
+    heatmap_avg = np.zeros((oriImg.shape[0], oriImg.shape[1], 19))
+    paf_avg = np.zeros((oriImg.shape[0], oriImg.shape[1], 38))
+
+    for scale in multiplier:
+        imageToTest = cv2.resize(oriImg, (0, 0), fx=scale, fy=scale)
+        image_padded, pad = util.padRightDownCorner(imageToTest, model_params['stride'], model_params['padValue'])
+        input_img = np.transpose(np.float32(image_padded[:, :, :, np.newaxis]), (3, 0, 1, 2))
+        output_blobs = model.predict(input_img)
+
+        heatmap = np.squeeze(output_blobs[1])
+        heatmap = cv2.resize(heatmap, (0, 0), fx=model_params['stride'], fy=model_params['stride'])
+        heatmap = heatmap[:image_padded.shape[0] - pad[2], :image_padded.shape[1] - pad[3], :]
+        heatmap = cv2.resize(heatmap, (oriImg.shape[1], oriImg.shape[0]))
+
+        paf = np.squeeze(output_blobs[0])
+        paf = cv2.resize(paf, (0, 0), fx=model_params['stride'], fy=model_params['stride'])
+        paf = paf[:image_padded.shape[0] - pad[2], :image_padded.shape[1] - pad[3], :]
+        paf = cv2.resize(paf, (oriImg.shape[1], oriImg.shape[0]))
+
+        heatmap_avg += heatmap / len(multiplier)
+        paf_avg += paf / len(multiplier)
+
+    return get_posture_label(heatmap_avg)
+
+# Main program
+if _name_ == '_main_':
+    # Start Arduino reader thread
+    threading.Thread(target=read_arduino, daemon=True).start()
+
+    # Load OpenPose model
+    print("📦 Loading OpenPose model...")
+    model = get_testing_model()
+    model.load_weights('./model/keras/model.h5')
+    params, model_params = config_reader()
+
+    # Setup webcam and log file
+    cap = cv2.VideoCapture(0)
+    logfile = open("combined_posture_log.csv", "w", newline='')
+    writer = csv.writer(logfile)
+    writer.writerow(["timestamp", "backDistance", "sideDistance", "arduinoPosture", "openposePosture"])
+
+    if not cap.isOpened():
+        print("❌ Webcam not found!")
+        exit()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # OpenPose label
+        openpose_label = get_posture_label(frame)  # Uses your existing classifier
+
+        # Combine info
+        ts = int(time.time())
+        writer.writerow([ts, back_distance, side_distance, arduino_posture, openpose_label])
+
+        label = f"Sensor: {arduino_posture} | OpenPose: {openpose_label}"
+        cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
+        if arduino_posture == "BAD" or openpose_label in ["Slouching", "Kneeling"]:
+            cv2.putText(frame, "⚠ BAD POSTURE!", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+
+        cv2.imshow("Posture Monitor", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    logfile.close()
+    cv2.destroyAllWindows()
